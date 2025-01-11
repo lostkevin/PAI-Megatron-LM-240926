@@ -22,6 +22,9 @@ except ImportError:
 
         HAVE_APEX_OR_TE = False
 
+from megatron.core import parallel_state
+from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+
 from .. import tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing import ShardedTensor
@@ -294,6 +297,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         gbuf_ranges: List[Dict],
         param_gbuf_map: Dict[torch.nn.Parameter, Tuple],
         opt_group_ranges: List,
+        make_param_fp32_copy: bool = True,
     ):
         """
         Create main parameter groups needed for the optimizer step.
@@ -340,6 +344,32 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 gbuf_index, dtype, bucket_index = param_gbuf_map[model_param]
                 gbuf_range = gbuf_ranges[gbuf_index][dtype][bucket_index]
                 param_range = gbuf_range["param_map"][model_param]["param"]
+
+                if not make_param_fp32_copy:
+                    shard_model_param = model_param.detach().view(-1)[
+                        param_range.start : param_range.end
+                    ]
+                    tensor_parallel.copy_tensor_model_parallel_attributes(
+                        shard_model_param, model_param
+                    )
+                    if hasattr(model_param, 'shared'):
+                        shard_model_param.shared = model_param.shared
+
+                    if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
+                        model_float16_params_this_group.append(model_param)
+                        shard_float16_params_this_group.append(shard_model_param)
+                    elif model_param.type() == 'torch.cuda.FloatTensor':
+                        model_fp32_params_this_group.append(model_param)
+                        shard_fp32_params_this_group.append(shard_model_param)
+                    else:
+                        raise TypeError(
+                            'Wrapped parameters must be one of '
+                            'torch.cuda.FloatTensor,  '
+                            'torch.cuda.HalfTensor, or '
+                            'torch.cuda.BFloat16Tensor. '
+                            'Received {}'.format(model_param.type())
+                        )
+                    continue
 
                 # fp16, bf16 params.
                 if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
@@ -403,6 +433,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     )
 
             # Update optimizer's params.
+            if not make_param_fp32_copy:
+                group_range["orig_group"]["params"] = [
+                    *shard_float16_params_this_group,
+                    *shard_fp32_params_this_group,
+                ]
+                continue
+
             group_range["orig_group"]["params"] = [
                 *shard_fp32_params_this_group,
                 *shard_fp32_from_float16_params_this_group,
@@ -472,9 +509,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for model_chunk in self.model_chunks:
             assert self.ddp_config == model_chunk.ddp_config
 
-        assert isinstance(
-            optimizer, Adam
-        ), "Only Adam currently supported, due to checkpointing requirements."
+        # assert isinstance(
+        #     optimizer, Adam
+        # ), "Only Adam currently supported, due to checkpointing requirements."
 
         # Model grad buffer ranges.
         assert per_model_buffers is not None, "per_model_buffers must be provided"
@@ -530,14 +567,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.shard_fp32_groups,
             self.shard_fp32_from_float16_groups,
         ) = self._build_model_and_main_param_groups(
-            self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges
+            self.gbuf_ranges,
+            self.model_param_gbuf_map,
+            self.opt_group_ranges,
+            make_param_fp32_copy=not isinstance(self.optimizer, HybridDeviceOptimizer),
         )
 
-        # Update optimizer groups.
-        # - Also, leverage state_dict() and load_state_dict() to
-        #   recast preexisting per-param state tensors.
-        self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
-        self.optimizer.load_state_dict(self.optimizer.state_dict())
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            self.optimizer = HybridDeviceOptimizer(
+                params=[g["orig_group"] for g in self.opt_group_ranges], **self.optimizer.defaults
+            )
+        else:
+            self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
+            self.optimizer.load_state_dict(self.optimizer.state_dict())
 
     def enable_pre_hook(self):
         """
@@ -595,6 +637,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             steps = list(set([s["step"].item() for s in inner_state_dict["state"].values()]))
             assert len(steps) == 1
             step = steps[0]
+        elif isinstance(self.optimizer, HybridDeviceOptimizer):
+            step = None
+            for optimizer in self.optimizer.sub_optimizers:
+                if isinstance(optimizer, torch.optim.AdamW):
+                    if len(optimizer.state) == 0:
+                        continue
+                    steps = list(set([s["step"].item() for s in optimizer.state.values()]))
+                    assert len(steps) == 1, f"steps: {optimizer.state}"
+                    step = steps[0]
+                    break
 
         # Optimizer state (do not store parameter state here).
         state_dict['optimizer'] = {k: v for k, v in inner_state_dict.items() if k != "state"}
@@ -603,6 +655,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             if not HAVE_APEX_OR_TE:
                 # Native PyTorch param group requires step (i.e., iteration).
                 param_group["step"] = step
+            elif isinstance(self.optimizer, HybridDeviceOptimizer) and step is not None:
+                param_group["step"] = int(step)
 
         # Grad scaler state.
         if self.grad_scaler:
@@ -639,6 +693,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         - state_order : The index of a parameter within the shared parameter
             list.
         """
+        if isinstance(self.optimizer, HybridDeviceOptimizer) and len(self.optimizer.state) == 0:
+            self.optimizer.dummy_step()
 
         # Get the Torch optimizer's state dict.
         # - This 'inner' optimizer at this point is unallocated, and only
@@ -700,6 +756,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for s in state_dict_state.values():
                 # Native PyTorch state dict requires step (i.e., iteration).
                 s["step"] = step
+        elif isinstance(self.optimizer, HybridDeviceOptimizer):
+            # Handle Torch AdamW special case, which, unlike FusedAdam, Torch AdamW
+            # has an extra optimizer state “step”.
+            steps = list(
+                set([g["step"] for g in state_dict["optimizer"]["param_groups"] if "step" in g])
+            )
+            if len(steps) != 0:
+                assert len(steps) == 1, f"steps: {steps}"
+                step = torch.tensor(steps[0], dtype=torch.float32, device="cpu")
+                for v in self.optimizer.state.values():
+                    v["step"] = step.detach().clone()
 
         # Optimizer.
         self.optimizer.load_state_dict(
@@ -1121,6 +1188,25 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         prefix = 'optimizer.state'
         state = {}
 
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            # Prepare a map of each parameter and layer offset to be used for
+            # dist-checkpoint sharded tensor creation for special state "step".
+            param_prepend_offsets = {}
+
+            # Initialize the map with zeros for all parameters.
+            for model_chunk in self.model_chunks:
+                for module in model_chunk.modules():
+                    for param in module.parameters():
+                        param_prepend_offsets[param] = []
+
+            # Update the map with the actual layer offset for TransformerLayer parameters.
+            for model_chunk in self.model_chunks:
+                for module in model_chunk.modules():
+                    if hasattr(module, 'layer_number'):
+                        offset = module.layer_number - 1
+                        for name, param in module.named_parameters():
+                            param_prepend_offsets[param] = [(0, offset, module.config.num_layers)]
+
         # Not stored in the checkpoint, used only to identify params in
         # `sharded_param_state_fs_model_space`.
         param_idx = 0
@@ -1134,7 +1220,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         main_param = self.optimizer.param_groups[group_index]["params"][group_order]
                         optim_state = self.optimizer.state[main_param]
 
-                        tensors = {"fp32_param": main_param, **optim_state}
+                        if isinstance(self.optimizer, HybridDeviceOptimizer):
+                            tensors = {**optim_state}
+                        else:
+                            tensors = {"fp32_param": main_param, **optim_state}
                         # Match optimizer parameter with model ShardedTensor (or
                         # ShardedTensorFactory).
                         try:
@@ -1153,6 +1242,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # Instantiate ShardedTensor (or ShardedTensorFactory) for optimizer
                         # params.
                         for state_key, state_ten in tensors.items():
+                            if state_key == 'step':
+                                # Note that step is a 0-dim tensor, unlike other
+                                # states have the same size as the parameter.
+                                # The optimizer state of STEP is handled
+                                # specifically and is read from param_groups.
+                                continue
+
                             replace_kwargs = dict(
                                 key=f'{prefix}.{state_key}.{sharded_metadata.key}',
                                 data=state_ten,
@@ -1229,11 +1325,23 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         optim_state = self.optimizer.state[main_param]
 
                         src_tensors = state_dict[param_idx]
-                        dst_tensors = {"fp32_param": main_param, **optim_state}
+                        if isinstance(self.optimizer, HybridDeviceOptimizer):
+                            dst_tensors = {**optim_state}
+                        else:
+                            dst_tensors = {"fp32_param": main_param, **optim_state}
                         for key in dst_tensors:
+                            if key == "step":
+                                # Handle step separately.
+                                continue
                             dst_tensors[key].copy_(src_tensors[key])
 
+                        if isinstance(self.optimizer, HybridDeviceOptimizer):
+                            for key in src_tensors:
+                                if key not in dst_tensors:
+                                    optim_state[key] = src_tensors[key]
                         param_idx += 1
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            self.optimizer._sync_hdo_state_to_sub_optimizers()
 
     @classmethod
     def _update_legacy_world_tensors(cls, old_tensors, new_numels):
@@ -1676,6 +1784,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         buffer, this method is responsible for copying the updated grads
         from the grad buffer to the main shard's grad field.
         """
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            shard_groups = self.shard_fp32_groups + self.shard_float16_groups
+            model_groups = self.model_fp32_groups + self.model_float16_groups
+            for model_group, shard_group in zip(model_groups, shard_groups):
+                for model_param, shard_param in zip(model_group, shard_group):
+                    param_range_map = self._get_model_param_range_map(model_param)
+                    param_range = param_range_map["param"]
+                    assert param_range.size == shard_param.nelement()
+
+                    model_grad = model_param.main_grad
+                    shard_model_grad = model_grad.view(-1)[param_range.start : param_range.end]
+                    shard_param.main_grad = shard_model_grad.float()
+            return
 
         # Utility method for copying group grads.
         def copy_group_grads(model_groups, shard_main_groups):
@@ -1702,6 +1823,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         buffer, this method is responsible for copying the updated params
         from the main shards into the correct position in the grad buffer.
         """
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            return
 
         # Utility method for copying group params.
         def copy_group_params(shard_main_groups, model_groups):
@@ -1753,6 +1876,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         the model params. This copy does not make use of the grad buffer as
         an intermediary.
         """
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            return
 
         # Utility method for copying group params.
         def copy_group_params(model_groups, shard_main_groups):

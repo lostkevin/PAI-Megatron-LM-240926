@@ -121,11 +121,9 @@ def get_grad_norm_fp32(
 
 
 def clip_grad_by_total_norm_fp32(
-    parameters: Union[List[torch.Tensor], torch.Tensor],
-    max_norm: Union[int, float],
-    total_norm: float,
+    grads: List[torch.Tensor], max_norm: Union[int, float], total_norm: float
 ):
-    """Clips gradient of an iterable of parameters in fp32 by total norm.
+    """Clips iterable of gradients in fp32 by total norm.
 
     Note that the gradients are modified in place.
 
@@ -135,13 +133,6 @@ def clip_grad_by_total_norm_fp32(
         max_norm (float or int): max norm of the gradients.
         total_norm (float): total norm of the gradients.
     """
-    # Grads.
-    grads = []
-    for param in parameters:
-        if param.grad is not None:
-            assert param.grad.type() == 'torch.cuda.FloatTensor'
-            grads.append(param.grad.detach())
-
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)
     if clip_coeff < 1.0:
